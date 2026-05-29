@@ -5,6 +5,7 @@ import json
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import yfinance as yf
 
 from analyzer import FinancialAnalyzer
 from data_loader import get_financials
@@ -103,9 +104,9 @@ def score_metrics(latest: pd.Series) -> dict:
     avg = total / n if n else 0.0
 
     # 積極型門檻：HOLD 區間較窄(平均分 -0.4 ~ 0.4)，讓買賣訊號更積極。
-    if avg >= 0.4:
+    if avg >= 0.6:
         signal = "BUY"
-    elif avg <= -0.4:
+    elif avg <= -0.6:
         signal = "SELL"
     else:
         signal = "HOLD"
@@ -138,7 +139,7 @@ AI_SYSTEM_PROMPT = (
 )
 
 
-def get_ai_advice(metrics_df: pd.DataFrame) -> tuple[str, dict | None]:
+def prepare_ai_request(metrics_df: pd.DataFrame) -> tuple[list[dict], dict]:
     api_key = st.session_state.get("openai_api_key", "")
     if not api_key:
         raise ValueError("請先在左側輸入 OpenAI API Key。")
@@ -189,6 +190,18 @@ def get_ai_advice(metrics_df: pd.DataFrame) -> tuple[str, dict | None]:
         f"近期指標趨勢(JSON)：\n{json.dumps(trend, ensure_ascii=False, indent=2)}\n"
     )
 
+    messages = [
+        {"role": "system", "content": AI_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+    return messages, score_info
+
+
+def stream_ai_advice(messages: list[dict]):
+    api_key = st.session_state.get("openai_api_key", "")
+    if not api_key:
+        raise ValueError("請先在左側輸入 OpenAI API Key。")
+
     try:
         from openai import OpenAI  # type: ignore
     except Exception as e:
@@ -196,21 +209,33 @@ def get_ai_advice(metrics_df: pd.DataFrame) -> tuple[str, dict | None]:
 
     client = OpenAI(api_key=api_key)
 
-    resp = client.chat.completions.create(
+    # 串流輸出：邊生成邊顯示，縮短等待感並加速首字出現。
+    stream = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": AI_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
+        messages=messages,
         temperature=0.6,
+        stream=True,
     )
-
-    text = (resp.choices[0].message.content or "").strip()
-    return text, score_info
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
 
 
 @st.cache_data(show_spinner=False)
-def load_and_analyze(stock_id: str) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], float | None]:
+def get_stock_name(stock_id: str) -> str | None:
+    symbol = stock_id if stock_id.endswith(".TW") else f"{stock_id}.TW"
+    try:
+        info = yf.Ticker(symbol).info or {}
+        return info.get("longName") or info.get("shortName")
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def load_and_analyze(stock_id: str) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], float | None, str | None]:
     data = get_financials(stock_id)
     analyzer = FinancialAnalyzer(
         data["income_statement"],
@@ -219,7 +244,8 @@ def load_and_analyze(stock_id: str) -> tuple[pd.DataFrame, dict[str, pd.DataFram
         stock_id=stock_id,
     )
     summary_df = analyzer.summary()
-    return summary_df, data, analyzer.current_price
+    stock_name = get_stock_name(stock_id)
+    return summary_df, data, analyzer.current_price, stock_name
 
 
 with st.sidebar:
@@ -235,9 +261,10 @@ if "analysis" not in st.session_state:
 
 if run:
     with st.spinner("正在抓取財報並計算指標..."):
-        summary_df, raw, current_price = load_and_analyze(stock_id)
+        summary_df, raw, current_price, stock_name = load_and_analyze(stock_id)
     st.session_state["analysis"] = {
         "stock_id": stock_id,
+        "stock_name": stock_name,
         "summary_df": summary_df,
         "raw": raw,
         "current_price": current_price,
@@ -250,8 +277,14 @@ if analysis:
     raw = analysis["raw"]
     current_price = analysis["current_price"]
     sid = analysis["stock_id"]
+    stock_name = analysis.get("stock_name")
 
-    st.caption(f"股票代碼：{sid if sid.endswith('.TW') else sid + '.TW'}；目前股價（估）：{current_price}")
+    symbol = sid if sid.endswith(".TW") else sid + ".TW"
+    if stock_name:
+        st.subheader(f"{stock_name}（{symbol}）")
+    else:
+        st.subheader(symbol)
+    st.caption(f"股票代碼：{symbol}；公司名稱：{stock_name or '—'}；目前股價（估）：{current_price}")
 
     if summary_df is None or summary_df.empty:
         st.error("查無財報資料，請確認代碼是否正確或稍後再試。")
@@ -318,26 +351,27 @@ if analysis:
     st.subheader("AI 診斷報告")
     gen = st.button("生成 AI 診斷報告", type="secondary", key="gen_ai_report")
     if gen:
-        with st.spinner("AI 生成中..."):
-            try:
-                report, score_info = get_ai_advice(summary_df)
+        try:
+            with st.spinner("準備量化評分..."):
+                messages, score_info = prepare_ai_request(summary_df)
 
-                if score_info:
-                    signal = score_info["signal"]
-                    signal_zh = {"BUY": "買進", "HOLD": "持有", "SELL": "賣出"}.get(signal, signal)
-                    sc1, sc2, sc3 = st.columns(3)
-                    sc1.metric("系統量化訊號", f"{signal}（{signal_zh}）")
-                    sc2.metric("總分", f"{score_info['total']} / {score_info['max']}")
-                    sc3.metric("平均分", score_info["avg"])
+            if score_info:
+                signal = score_info["signal"]
+                signal_zh = {"BUY": "買進", "HOLD": "持有", "SELL": "賣出"}.get(signal, signal)
+                sc1, sc2, sc3 = st.columns(3)
+                sc1.metric("系統量化訊號", f"{signal}（{signal_zh}）")
+                sc2.metric("總分", f"{score_info['total']} / {score_info['max']}")
+                sc3.metric("平均分", score_info["avg"])
 
-                    score_table = pd.DataFrame(
-                        {"得分": {SUMMARY_COL_ZH.get(k, k): v for k, v in score_info["details"].items()}}
-                    )
-                    st.dataframe(score_table, use_container_width=True)
+                score_table = pd.DataFrame(
+                    {"得分": {SUMMARY_COL_ZH.get(k, k): v for k, v in score_info["details"].items()}}
+                )
+                st.dataframe(score_table, use_container_width=True)
 
-                st.markdown(report)
-            except Exception as e:
-                st.error(str(e))
+            # 串流顯示 AI 報告：逐字輸出，首字更快、整體等待感更短。
+            st.write_stream(stream_ai_advice(messages))
+        except Exception as e:
+            st.error(str(e))
 
     with st.expander("原始三大報表（可選）"):
         st.write("損益表")
