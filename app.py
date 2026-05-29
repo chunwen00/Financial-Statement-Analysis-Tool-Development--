@@ -49,8 +49,92 @@ STATEMENT_COL_ZH = {
     "Capital Expenditures": "資本支出(CapEx)",
 }
 
+# ── 量化評分系統 ──────────────────────────────────────────────
+# 每個指標依門檻給分(-2 最差 ~ +2 最佳)；分數越高越偏多(買進)。
+# 正向指標(數值越高越好)：門檻為「>=」，由高到低判斷。
+POSITIVE_SCORE_RULES = {
+    "Gross_Margin": [(0.40, 2), (0.25, 1), (0.15, 0), (0.10, -1)],
+    "Operating_Margin": [(0.20, 2), (0.10, 1), (0.05, 0), (0.00, -1)],
+    "ROE": [(0.20, 2), (0.15, 1), (0.08, 0), (0.00, -1)],
+    "EPS_Growth": [(0.20, 2), (0.05, 1), (-0.05, 0), (-0.20, -1)],
+    "Revenue_YoY": [(0.15, 2), (0.05, 1), (-0.05, 0), (-0.15, -1)],
+    "Current_Ratio": [(2.00, 2), (1.50, 1), (1.00, 0), (0.80, -1)],
+}
+# 反向指標(數值越低越好)：門檻為「<=」，由低到高判斷。
+NEGATIVE_SCORE_RULES = {
+    "Debt_Ratio": [(0.30, 2), (0.50, 1), (0.60, 0), (0.70, -1)],
+    "PE": [(10.0, 2), (15.0, 1), (20.0, 0), (30.0, -1)],
+}
+
+
+def _score_positive(value: float, rules: list[tuple[float, int]]) -> int:
+    for threshold, score in rules:
+        if value >= threshold:
+            return score
+    return -2
+
+
+def _score_negative(value: float, rules: list[tuple[float, int]]) -> int:
+    for threshold, score in rules:
+        if value <= threshold:
+            return score
+    return -2
+
+
+def score_metrics(latest: pd.Series) -> dict:
+    details: dict[str, int] = {}
+
+    for col, rules in POSITIVE_SCORE_RULES.items():
+        v = latest.get(col)
+        if v is not None and not pd.isna(v):
+            details[col] = _score_positive(float(v), rules)
+
+    for col, rules in NEGATIVE_SCORE_RULES.items():
+        v = latest.get(col)
+        if v is not None and not pd.isna(v):
+            details[col] = _score_negative(float(v), rules)
+
+    fcf = latest.get("Free_Cash_Flow")
+    if fcf is not None and not pd.isna(fcf):
+        details["Free_Cash_Flow"] = 1 if float(fcf) > 0 else -2
+
+    total = sum(details.values())
+    n = len(details)
+    avg = total / n if n else 0.0
+
+    # 積極型門檻：HOLD 區間較窄(平均分 -0.4 ~ 0.4)，讓買賣訊號更積極。
+    if avg >= 0.4:
+        signal = "BUY"
+    elif avg <= -0.4:
+        signal = "SELL"
+    else:
+        signal = "HOLD"
+
+    return {"details": details, "total": total, "max": n * 2, "avg": round(avg, 3), "signal": signal}
+
+
 AI_SYSTEM_PROMPT = (
-    "你是一位精通台股的價值投資專家，請分析這家公司的財務體質，指出優點與潛在風險，並給予投資操作建議。語氣要專業、客觀。"
+    "你是一位精通台股的價值投資專家。你會收到一家公司近幾期的關鍵財務指標(含趨勢)，以及一份系統用量化門檻算出的評分。\n"
+    "請分析財務體質，指出優點與潛在風險，並給出明確的投資操作建議。語氣要專業、客觀。\n"
+    "\n"
+    "量化評分門檻(每個指標 -2 ~ +2 分)：\n"
+    "- 毛利率：>=40% 給 +2、>=25% +1、>=15% 0、>=10% -1、其餘 -2\n"
+    "- 營業利益率：>=20% +2、>=10% +1、>=5% 0、>=0% -1、<0% -2\n"
+    "- ROE：>=20% +2、>=15% +1、>=8% 0、>=0% -1、<0% -2\n"
+    "- EPS成長率：>=20% +2、>=5% +1、>=-5% 0、>=-20% -1、其餘 -2\n"
+    "- 營收年增率(YoY)：>=15% +2、>=5% +1、>=-5% 0、>=-15% -1、其餘 -2\n"
+    "- 流動比率：>=2 +2、>=1.5 +1、>=1 0、>=0.8 -1、<0.8 -2\n"
+    "- 負債比率：<=30% +2、<=50% +1、<=60% 0、<=70% -1、>70% -2\n"
+    "- 本益比(PE)：<=10 +2、<=15 +1、<=20 0、<=30 -1、>30 -2\n"
+    "- 自由現金流：為正 +1、為負 -2\n"
+    "\n"
+    "操作建議規則(積極型)：依各指標平均分數決定，平均分 >=0.4 → BUY、<=-0.4 → SELL、其餘 → HOLD。\n"
+    "\n"
+    "重要規則：\n"
+    "1. 你必須明確在 BUY / HOLD / SELL 三者擇一，不可迴避，也不要因資訊不足就預設 HOLD。\n"
+    "2. 原則上以系統量化訊號為主；若近期『趨勢方向』明顯與量化訊號相反(例如分數高但各項指標連續惡化)，可調整，但須明確說明理由。\n"
+    "3. 理由需引用具體指標數值、其得分與趨勢。\n"
+    "4. 最後務必輸出一行『信心分數：x/10』。\n"
 )
 
 
@@ -65,29 +149,44 @@ def get_ai_advice(metrics_df: pd.DataFrame) -> tuple[str, dict | None]:
     if df.empty:
         raise ValueError("指標表為空，無法產生 AI 分析。")
 
-    latest = df.iloc[-1]
+    recent = df.tail(4)
     latest_date = str(df.index[-1].date()) if isinstance(df.index, pd.DatetimeIndex) else str(df.index[-1])
 
-    payload = {}
-    for k, v in latest.to_dict().items():
-        if pd.isna(v):
-            payload[k] = None
-        elif isinstance(v, (int, float)):
-            payload[k] = float(v)
-        else:
-            payload[k] = str(v)
+    trend = {}
+    for date, row in recent.iterrows():
+        date_key = str(date.date()) if isinstance(df.index, pd.DatetimeIndex) else str(date)
+        period = {}
+        for k, v in row.to_dict().items():
+            zh = SUMMARY_COL_ZH.get(k, k)
+            if pd.isna(v):
+                period[zh] = None
+            elif isinstance(v, (int, float)):
+                period[zh] = round(float(v), 6)
+            else:
+                period[zh] = str(v)
+        trend[date_key] = period
 
-    metrics_zh = {SUMMARY_COL_ZH.get(k, k): v for k, v in payload.items()}
+    score_info = score_metrics(df.iloc[-1])
+    score_zh = {SUMMARY_COL_ZH.get(k, k): v for k, v in score_info["details"].items()}
+    score_summary = {
+        "各指標得分": score_zh,
+        "總分": score_info["total"],
+        "滿分": score_info["max"],
+        "平均分": score_info["avg"],
+        "系統量化訊號": score_info["signal"],
+    }
 
     user_prompt = (
-        f"以下是公司最新一季(或最新一期)的關鍵財務指標，日期：{latest_date}\n"
+        f"以下是公司近 {len(recent)} 期的關鍵財務指標(由舊到新，最新一期為 {latest_date})，請特別觀察各指標的趨勢方向。\n"
         f"請依價值投資觀點，給出：\n"
         f"1) 財務體質總評\n"
         f"2) 優點(條列)\n"
         f"3) 風險(條列)\n"
-        f"4) 操作建議：請在 BUY / HOLD / SELL 三選一\n"
-        f"5) 理由(條列)\n\n"
-        f"指標(JSON)：\n{json.dumps(metrics_zh, ensure_ascii=False, indent=2)}\n"
+        f"4) 操作建議：請在 BUY / HOLD / SELL 三選一(必須明確選邊，原則上以系統量化訊號為主)\n"
+        f"5) 理由(條列，需引用具體指標數值、得分與趨勢)\n"
+        f"6) 信心分數：x/10\n\n"
+        f"系統量化評分(最新一期)：\n{json.dumps(score_summary, ensure_ascii=False, indent=2)}\n\n"
+        f"近期指標趨勢(JSON)：\n{json.dumps(trend, ensure_ascii=False, indent=2)}\n"
     )
 
     try:
@@ -103,11 +202,11 @@ def get_ai_advice(metrics_df: pd.DataFrame) -> tuple[str, dict | None]:
             {"role": "system", "content": AI_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.4,
+        temperature=0.6,
     )
 
     text = (resp.choices[0].message.content or "").strip()
-    return text, None
+    return text, score_info
 
 
 @st.cache_data(show_spinner=False)
@@ -221,7 +320,21 @@ if analysis:
     if gen:
         with st.spinner("AI 生成中..."):
             try:
-                report, _ = get_ai_advice(summary_df)
+                report, score_info = get_ai_advice(summary_df)
+
+                if score_info:
+                    signal = score_info["signal"]
+                    signal_zh = {"BUY": "買進", "HOLD": "持有", "SELL": "賣出"}.get(signal, signal)
+                    sc1, sc2, sc3 = st.columns(3)
+                    sc1.metric("系統量化訊號", f"{signal}（{signal_zh}）")
+                    sc2.metric("總分", f"{score_info['total']} / {score_info['max']}")
+                    sc3.metric("平均分", score_info["avg"])
+
+                    score_table = pd.DataFrame(
+                        {"得分": {SUMMARY_COL_ZH.get(k, k): v for k, v in score_info["details"].items()}}
+                    )
+                    st.dataframe(score_table, use_container_width=True)
+
                 st.markdown(report)
             except Exception as e:
                 st.error(str(e))
