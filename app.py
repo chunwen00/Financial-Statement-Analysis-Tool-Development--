@@ -244,13 +244,53 @@ TW_STOCK_NAMES = {
 }
 
 
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def fetch_twse_names() -> dict[str, str]:
+    """從證交所 ISIN 清單抓取上市/上櫃股票的『代碼 → 中文名稱』對照。"""
+    try:
+        import re
+
+        import requests
+    except Exception:
+        return {}
+
+    mapping: dict[str, str] = {}
+    # strMode=2：上市；strMode=4：上櫃
+    urls = [
+        "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2",
+        "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4",
+    ]
+    headers = {"User-Agent": "Mozilla/5.0"}
+    # 第一欄格式為『>2330　台積電<』：以全形空白分隔代號與名稱。
+    pattern = re.compile(r">(\d{4,7})\u3000([^<]+?)<")
+
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            resp.encoding = "big5"
+            for code, name in pattern.findall(resp.text):
+                mapping[code] = name.strip()
+        except Exception:
+            continue
+
+    return mapping
+
+
 @st.cache_data(show_spinner=False)
 def get_stock_name(stock_id: str) -> str | None:
     code = stock_id[:-3] if stock_id.endswith(".TW") else stock_id
+
+    # 1) 優先使用證交所自動清單(涵蓋全部上市櫃)
+    twse = fetch_twse_names()
+    if code in twse:
+        return twse[code]
+
+    # 2) 證交所抓取失敗時，使用內建常見對照表
     zh = TW_STOCK_NAMES.get(code)
     if zh:
         return zh
 
+    # 3) 最後以 yfinance 英文名遞補
     symbol = f"{code}.TW"
     try:
         info = yf.Ticker(symbol).info or {}
